@@ -9,6 +9,7 @@ Portability : non-portable
 Core glue for running an application.
 -}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE Strict #-}
 
@@ -76,6 +77,7 @@ data MainLoopArgs sp e ep = MainLoopArgs {
   _mlOS :: Text,
   _mlTheme :: Theme,
   _mlAppStartTs :: Millisecond,
+  _mlResizeEvent :: SDL.RegisteredEventType (),
   _mlMaxFps :: Int,
   _mlLatestRenderTs :: Millisecond,
   _mlFrameStartTs :: Millisecond,
@@ -144,6 +146,7 @@ runAppLoop window glCtx channel widgetRoot config = do
   let mainBtn = fromMaybe BtnLeft (_apcMainButton config)
   let contextBtn = fromMaybe BtnRight (_apcContextButton config)
 
+  resizeEvent <- registerResizeEvent
   appStartTs <- getCurrentTimestamp
   model <- use L.mainModel
   os <- liftIO getPlatform
@@ -221,7 +224,7 @@ runAppLoop window glCtx channel widgetRoot config = do
   case setupRes of
     RenderSetupMulti -> do
       liftIO . atomically $ writeTChan channel (MsgInit newWenv newRoot)
-      liftIO $ watchWindowResize channel
+      liftIO $ watchWindowResize resizeEvent channel
     _ -> return ()
 
   let loopArgs = MainLoopArgs {
@@ -229,6 +232,7 @@ runAppLoop window glCtx channel widgetRoot config = do
     _mlTheme = theme,
     _mlMaxFps = maxFps,
     _mlAppStartTs = appStartTs,
+    _mlResizeEvent = resizeEvent,
     _mlLatestRenderTs = 0,
     _mlFrameStartTs = 0,
     _mlFrameAccumTs = 0,
@@ -274,7 +278,8 @@ mainLoop window fontManager config loopArgs = do
   let eventsPayload = fmap SDL.eventPayload events
   let quit = SDL.QuitEvent `elem` eventsPayload
 
-  let windowResized = currWinSize /= windowSize && isWindowResized eventsPayload
+  hasResizedEvent <- isWindowResized _mlResizeEvent events
+  let windowResized = currWinSize /= windowSize || hasResizedEvent
   let windowExposed = isWindowExposed eventsPayload
   let mouseEntered = isMouseEntered eventsPayload
   let invertX = fromMaybe False (_apcInvertWheelX config)
@@ -455,22 +460,6 @@ handleRenderMsg window renderer fontMgr state (MsgRender tmpWenv newRoot) = do
   let color = newWenv ^. L.theme . L.clearColor
   renderWidgets window dpr renderer color newWenv newRoot
   return (RenderState dpr newWenv newRoot)
-handleRenderMsg window renderer fontMgr state (MsgResize _) = do
-  newSize <- getViewportSize window (_rstDpr state)
-
-  let RenderState dpr wenv root = state
-  let viewport = Rect 0 0 (newSize ^. L.w) (newSize ^. L.h)
-  let newWenv = wenv
-        & L.fontManager .~ fontMgr
-        & L.windowSize .~ newSize
-        & L.viewport .~ viewport
-  let color = newWenv ^. L.theme . L.clearColor
-  let resizeCheck = const False
-  let result = widgetResize (root ^. L.widget) newWenv root viewport resizeCheck
-  let newRoot = result ^. L.node
-
-  renderWidgets window dpr renderer color newWenv newRoot
-  return state
 handleRenderMsg window renderer fontMgr state (MsgRemoveImage name) = do
   deleteImage renderer name
   return state
@@ -516,15 +505,24 @@ renderWidgets window dpr renderer clearColor wenv widgetRoot = do
     b = fromIntegral (clearColor ^. L.b) / 255
     a = realToFrac (clearColor ^. L.a)
 
-watchWindowResize :: TChan (RenderMsg s e) -> IO ()
-watchWindowResize channel = do
+registerResizeEvent :: MonomerM s e m => m (SDL.RegisteredEventType ())
+registerResizeEvent = do
+  SDL.registerEvent toEvent fromEvent >>= \case
+    Nothing -> error "Registering resize event failed. This should not happen!"
+    Just re -> pure re
+  where
+    -- todo: make these less unsafe somehow...
+    toEvent _ _ = pure (Just ()) 
+    fromEvent _ = pure SDL.emptyRegisteredEvent
+
+watchWindowResize :: SDL.RegisteredEventType () -> TChan (RenderMsg s e) -> IO ()
+watchWindowResize (SDL.RegisteredEventType pushEvent _) channel = do
   void . SDL.addEventWatch $ \ev -> do
     case SDL.eventPayload ev of
       SDL.WindowSizeChangedEvent sizeChangeData -> do
-        let SDL.V2 nw nh = SDL.windowSizeChangedEventSize sizeChangeData
-        let newSize = Size (fromIntegral nw) (fromIntegral nh)
-
-        atomically $ writeTChan channel (MsgResize newSize)
+        pushEvent () >>= \case
+          SDL.EventPushSuccess -> pure ()
+          res -> error "Window resize event push did not succeed. This should not happen!"
       _ -> return ()
 
 checkRenderCurrent :: (MonomerM s e m) => Millisecond -> Millisecond -> m Bool
@@ -550,9 +548,14 @@ renderScheduleActive currTs schedule = scheduleActive where
   stepCount = floor (fromIntegral (currTs - start) / fromIntegral ms)
   scheduleActive = maybe True (> stepCount) count
 
-isWindowResized :: [SDL.EventPayload] -> Bool
-isWindowResized eventsPayload = not status where
-  status = null [ e | e@SDL.WindowResizedEvent {} <- eventsPayload ]
+isWindowResized :: MonomerM s e m => SDL.RegisteredEventType () -> [SDL.Event] -> m Bool
+isWindowResized resizeEvent events = do
+  anyMatch <- traverse isResizeEvent events
+  pure (or anyMatch)
+  where
+    isResizeEvent = \case
+      SDL.Event _ SDL.WindowResizedEvent {} -> pure True
+      e -> liftIO (isJust <$> SDL.getRegisteredEvent resizeEvent e)
 
 isWindowExposed :: [SDL.EventPayload] -> Bool
 isWindowExposed eventsPayload = not status where
